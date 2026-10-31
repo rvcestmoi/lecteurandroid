@@ -19,7 +19,8 @@ public class MainActivity extends Activity {
     private TextView title, status, time, folder;
     private Button play, back, forward, previousTrack, nextTrack, shuffle;
     private SeekBar progress;
-    private LinearLayout songs;
+    private ArrayAdapter<String> songs;
+    private final List<MediaBrowser.MediaItem> songItems = new ArrayList<>();
     private final Handler handler = new Handler(Looper.getMainLooper());
     private boolean dragging, reloadPending;
     private final Runnable tick = new Runnable() {
@@ -31,14 +32,14 @@ public class MainActivity extends Activity {
     };
     private final MediaBrowser.SubscriptionCallback subscription = new MediaBrowser.SubscriptionCallback() {
         @Override public void onChildrenLoaded(String parentId, List<MediaBrowser.MediaItem> children) {
-            songs.removeAllViews();
-            if (children.isEmpty()) { TextView empty = text("Aucun titre. Choisissez un dossier contenant des fichiers audio.", 17); songs.addView(empty); }
+            songItems.clear(); songItems.addAll(children);
+            songs.setNotifyOnChange(false);
+            songs.clear();
+            if (children.isEmpty()) songs.add("Aucun titre. Choisissez un dossier contenant des fichiers audio.");
             for (MediaBrowser.MediaItem item : children) {
-                Button row = button(item.getDescription().getTitle().toString(), 17);
-                row.setGravity(Gravity.CENTER_VERTICAL | Gravity.START);
-                row.setOnClickListener(v -> { if (controller != null) controller.getTransportControls().playFromMediaId(item.getMediaId(), null); });
-                songs.addView(row, new LinearLayout.LayoutParams(-1, -2));
+                songs.add(item.getDescription().getTitle().toString());
             }
+            songs.notifyDataSetChanged();
         }
     };
 
@@ -47,10 +48,11 @@ public class MainActivity extends Activity {
         setVolumeControlStream(AudioManager.STREAM_MUSIC);
         getWindow().setStatusBarColor(Color.rgb(16, 28, 35));
         getWindow().setNavigationBarColor(Color.rgb(16, 28, 35));
-        ScrollView scroll = new ScrollView(this);
+        ListView scroll = new ListView(this);
+        scroll.setBackgroundColor(Color.rgb(16, 28, 35));
         LinearLayout root = new LinearLayout(this); root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(dp(20), dp(20), dp(20), dp(24)); root.setBackgroundColor(Color.rgb(16, 28, 35));
-        scroll.addView(root); setContentView(scroll);
+        scroll.addHeaderView(root, null, false); setContentView(scroll);
         // Respect system bars on edge-to-edge Android versions.
         scroll.setOnApplyWindowInsetsListener((v, insets) -> {
             v.setPadding(insets.getSystemWindowInsetLeft(), insets.getSystemWindowInsetTop(), insets.getSystemWindowInsetRight(), insets.getSystemWindowInsetBottom());
@@ -90,8 +92,8 @@ public class MainActivity extends Activity {
         back = button("↶\n−15 s", 26); play = button("▶\nLecture", 25); forward = button("↷\n+30 s", 26);
         for (Button b : new Button[]{back, play, forward}) controls.addView(b, new LinearLayout.LayoutParams(0, dp(120), 1));
         root.addView(controls);
-        back.setOnClickListener(v -> { if (controller != null) controller.getTransportControls().skipToPrevious(); });
-        forward.setOnClickListener(v -> { if (controller != null) controller.getTransportControls().skipToNext(); });
+        back.setOnClickListener(v -> { if (controller != null) controller.getTransportControls().sendCustomAction("seek_back_15", null); });
+        forward.setOnClickListener(v -> { if (controller != null) controller.getTransportControls().sendCustomAction("seek_forward_30", null); });
         play.setOnClickListener(v -> {
             if (controller == null) return;
             PlaybackState s = controller.getPlaybackState();
@@ -110,7 +112,24 @@ public class MainActivity extends Activity {
         root.addView(shuffle);
         root.addView(text("Au volant : suivant = +30 s · précédent = −15 s", 14));
         TextView label = text("Titres du dossier", 22); label.setPadding(0, dp(24), 0, dp(8)); root.addView(label);
-        songs = new LinearLayout(this); songs.setOrientation(LinearLayout.VERTICAL); root.addView(songs);
+        songs = new ArrayAdapter<String>(this, android.R.layout.simple_list_item_1) {
+            @Override public View getView(int position, View convertView, ViewGroup parent) {
+                TextView row = (TextView) super.getView(position, convertView, parent);
+                row.setTextColor(Color.rgb(224, 239, 241));
+                row.setTextSize(17);
+                row.setMinHeight(dp(56));
+                row.setPadding(dp(24), dp(12), dp(24), dp(12));
+                row.setMaxLines(2);
+                row.setEllipsize(android.text.TextUtils.TruncateAt.END);
+                return row;
+            }
+        };
+        scroll.setAdapter(songs);
+        scroll.setOnItemClickListener((parent, view, position, id) -> {
+            int selected = position - scroll.getHeaderViewsCount();
+            if (controller != null && selected >= 0 && selected < songItems.size())
+                controller.getTransportControls().playFromMediaId(songItems.get(selected).getMediaId(), null);
+        });
         browser = new MediaBrowser(this, new ComponentName(this, PlaybackService.class), new MediaBrowser.ConnectionCallback() {
             @Override public void onConnected() {
                 controller = new MediaController(MainActivity.this, browser.getSessionToken());

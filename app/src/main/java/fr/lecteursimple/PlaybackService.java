@@ -28,16 +28,25 @@ public class PlaybackService extends MediaBrowserService {
     private String error;
     private String pendingSearch;
     private SharedPreferences prefs;
+    private SharedPreferences titleCache;
+    private volatile int scanGeneration;
+    private Future<?> scanTask;
     private final BroadcastReceiver noisy = new BroadcastReceiver() {
         @Override public void onReceive(Context c, Intent i) { pause(); }
     };
     private final Runnable checkpoint = new Runnable() {
-        @Override public void run() { save(); handler.postDelayed(this, 3000); }
+        private int ticks;
+        @Override public void run() {
+            if (++ticks % 3 == 0) save();
+            if (isPlaying()) publish(false);
+            handler.postDelayed(this, 1000);
+        }
     };
 
     @Override public void onCreate() {
         super.onCreate();
         prefs = getSharedPreferences("player", MODE_PRIVATE);
+        titleCache = getSharedPreferences("audio_titles_v1", MODE_PRIVATE);
         shuffle = prefs.getBoolean("shuffle", false);
         audio = (AudioManager) getSystemService(AUDIO_SERVICE);
         focus = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
@@ -61,8 +70,19 @@ public class PlaybackService extends MediaBrowserService {
             @Override public void onPlay() { play(); }
             @Override public void onPause() { pause(); }
             @Override public void onStop() { pause(); stopForeground(STOP_FOREGROUND_REMOVE); stopSelf(); }
-            @Override public void onSkipToNext() { jump(30000); }
-            @Override public void onSkipToPrevious() { jump(-15000); }
+            @Override public void onSkipToNext() { changeTrack(1); }
+            @Override public void onSkipToPrevious() { changeTrack(-1); }
+            @Override public boolean onMediaButtonEvent(Intent intent) {
+                android.view.KeyEvent key = intent.getParcelableExtra(Intent.EXTRA_KEY_EVENT);
+                if (key != null && (key.getKeyCode() == android.view.KeyEvent.KEYCODE_MEDIA_NEXT
+                        || key.getKeyCode() == android.view.KeyEvent.KEYCODE_MEDIA_PREVIOUS)) {
+                    // Physical media keys retain time jumps, independently of screen transport buttons.
+                    if (key.getAction() == android.view.KeyEvent.ACTION_DOWN && key.getRepeatCount() == 0)
+                        jump(key.getKeyCode() == android.view.KeyEvent.KEYCODE_MEDIA_NEXT ? 30000 : -15000);
+                    return true;
+                }
+                return super.onMediaButtonEvent(intent);
+            }
             @Override public void onFastForward() { jump(30000); }
             @Override public void onRewind() { jump(-15000); }
             @Override public void onSeekTo(long pos) { seek(pos); }
@@ -74,6 +94,8 @@ public class PlaybackService extends MediaBrowserService {
                 if ("reload".equals(action)) load();
                 else if ("previous_track".equals(action)) changeTrack(-1);
                 else if ("next_track".equals(action)) changeTrack(1);
+                else if ("seek_back_15".equals(action)) jump(-15000);
+                else if ("seek_forward_30".equals(action)) jump(30000);
                 else if ("toggle_shuffle".equals(action)) {
                     shuffle = !shuffle;
                     prefs.edit().putBoolean("shuffle", shuffle).apply();
@@ -96,13 +118,16 @@ public class PlaybackService extends MediaBrowserService {
         save(); releasePlayer(); audio.abandonAudioFocusRequest(focus); tracks.clear(); loading = true; playWhenReady = false; error = null;
         stopForeground(STOP_FOREGROUND_REMOVE); publish();
         int request = ++generation;
+        scanGeneration = request;
+        if (scanTask != null) scanTask.cancel(true);
         String tree = prefs.getString("folder", "");
-        io.execute(() -> {
+        scanTask = io.submit(() -> {
             List<MediaBrowser.MediaItem> found = new ArrayList<>(); String failure = null;
+            List<PendingTitle> pending = new ArrayList<>();
             try {
                 if (!tree.isEmpty()) {
                     Uri uri = Uri.parse(tree);
-                    scan(uri, DocumentsContract.getTreeDocumentId(uri), found, new HashSet<>());
+                    scan(uri, DocumentsContract.getTreeDocumentId(uri), found, pending, new HashSet<>(), request);
                     found.sort(Comparator.comparing(item -> item.getDescription().getTitle().toString(), String.CASE_INSENSITIVE_ORDER));
                 }
             } catch (Exception e) { failure = "Dossier inaccessible. Choisissez à nouveau le dossier."; }
@@ -118,23 +143,82 @@ public class PlaybackService extends MediaBrowserService {
                 else publish();
                 if (pendingSearch != null) { String query = pendingSearch; pendingSearch = null; search(query); }
             });
+            // Enumeration is already delivered: tag extraction never blocks the first playable list.
+            Map<String, String> updates = new HashMap<>();
+            SharedPreferences.Editor cachedTitles = titleCache.edit();
+            long deliveredAt = SystemClock.elapsedRealtime();
+            for (PendingTitle item : pending) {
+                if (request != scanGeneration || Thread.currentThread().isInterrupted()) return;
+                String title = readTitle(item.uri, item.filename);
+                if (request != scanGeneration || Thread.currentThread().isInterrupted()) return;
+                cachedTitles.putString(item.uri.toString(), item.signature + "\n" + title);
+                updates.put(item.uri.toString(), title);
+                if (updates.size() >= 20 || SystemClock.elapsedRealtime() - deliveredAt >= 750) {
+                    cachedTitles.apply(); cachedTitles = titleCache.edit();
+                    deliverTitles(request, updates); updates = new HashMap<>();
+                    deliveredAt = SystemClock.elapsedRealtime();
+                }
+            }
+            if (!updates.isEmpty()) { cachedTitles.apply(); deliverTitles(request, updates); }
         });
     }
 
-    private void scan(Uri tree, String id, List<MediaBrowser.MediaItem> result, Set<String> visited) {
-        if (!visited.add(id) || Thread.currentThread().isInterrupted()) return;
+    private static final class PendingTitle {
+        final Uri uri;
+        final String filename, signature;
+        PendingTitle(Uri uri, String filename, String signature) { this.uri = uri; this.filename = filename; this.signature = signature; }
+    }
+
+    private void deliverTitles(int request, Map<String, String> updates) {
+        handler.post(() -> {
+            if (request != generation) return;
+            for (int i = 0; i < tracks.size(); i++) {
+                MediaBrowser.MediaItem item = tracks.get(i);
+                String title = updates.get(item.getMediaId());
+                if (title != null) tracks.set(i, new MediaBrowser.MediaItem(new MediaDescription.Builder()
+                    .setMediaId(item.getMediaId()).setMediaUri(item.getDescription().getMediaUri()).setTitle(title).build(), MediaBrowser.MediaItem.FLAG_PLAYABLE));
+            }
+            // Keep indices stable: a title arriving must not change the current song or shuffle history.
+            notifyChildrenChanged("root"); publish();
+        });
+    }
+
+    private void scan(Uri tree, String id, List<MediaBrowser.MediaItem> result, List<PendingTitle> pending, Set<String> visited, int request) {
+        if (!visited.add(id) || request != scanGeneration || Thread.currentThread().isInterrupted()) return;
         Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, id);
-        try (Cursor cursor = getContentResolver().query(children, new String[]{"document_id", "_display_name", "mime_type"}, null, null, null)) {
+        try (Cursor cursor = getContentResolver().query(children, new String[]{"document_id", "_display_name", "mime_type", "last_modified", "_size"}, null, null, null)) {
             if (cursor == null) return;
             while (cursor.moveToNext()) {
+                if (request != scanGeneration || Thread.currentThread().isInterrupted()) return;
                 String child = cursor.getString(0), name = cursor.getString(1), mime = cursor.getString(2);
-                if (DocumentsContract.Document.MIME_TYPE_DIR.equals(mime)) scan(tree, child, result, visited);
+                if (DocumentsContract.Document.MIME_TYPE_DIR.equals(mime)) scan(tree, child, result, pending, visited, request);
                 else if ((mime != null && mime.startsWith("audio/")) || (name != null && name.toLowerCase(Locale.ROOT).matches(".*\\.(mp3|m4a|aac|flac|ogg|opus|wav)"))) {
                     Uri uri = DocumentsContract.buildDocumentUriUsingTree(tree, child);
-                    result.add(new MediaBrowser.MediaItem(new android.media.MediaDescription.Builder().setMediaId(uri.toString()).setMediaUri(uri).setTitle(name).build(), MediaBrowser.MediaItem.FLAG_PLAYABLE));
+                    String signature = (cursor.isNull(3) ? -1 : cursor.getLong(3)) + ":" + (cursor.isNull(4) ? -1 : cursor.getLong(4)) + ":" + name;
+                    String cached = titleCache.getString(uri.toString(), "");
+                    String prefix = signature + "\n";
+                    String title = cached.startsWith(prefix) ? cached.substring(prefix.length()) : name;
+                    if (title == null || title.trim().isEmpty()) title = "Titre inconnu";
+                    if (!cached.startsWith(prefix)) pending.add(new PendingTitle(uri, name, signature));
+                    result.add(new MediaBrowser.MediaItem(new android.media.MediaDescription.Builder().setMediaId(uri.toString()).setMediaUri(uri).setTitle(title).build(), MediaBrowser.MediaItem.FLAG_PLAYABLE));
                 }
             }
         }
+    }
+
+    // Called by the library scan on the I/O executor, never on the UI thread.
+    private String readTitle(Uri uri, String filename) {
+        MediaMetadataRetriever retriever = new MediaMetadataRetriever();
+        try {
+            retriever.setDataSource(this, uri);
+            String title = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE);
+            if (title != null && !title.trim().isEmpty()) return title.trim();
+        } catch (RuntimeException ignored) {
+            // Missing, unreadable or unsupported tags must not hide a playable file.
+        } finally {
+            try { retriever.release(); } catch (Exception ignored) { }
+        }
+        return filename == null || filename.trim().isEmpty() ? "Titre inconnu" : filename;
     }
 
     private boolean isPlaying() { return ready && player != null && player.isPlaying(); }
@@ -200,23 +284,42 @@ public class PlaybackService extends MediaBrowserService {
     private void releasePlayer() { ready = false; if (player != null) { player.release(); player = null; } }
 
     @android.annotation.SuppressLint("NotificationPermission") // Media-session notifications are exempt from POST_NOTIFICATIONS.
-    private void publish() {
+    private void publish() { publish(true); }
+
+    @android.annotation.SuppressLint("NotificationPermission") // MediaStyle notification with a session token.
+    private void publish(boolean updateNotification) {
         long actions = PlaybackState.ACTION_PLAY | PlaybackState.ACTION_PAUSE | PlaybackState.ACTION_PLAY_PAUSE | PlaybackState.ACTION_STOP | PlaybackState.ACTION_PLAY_FROM_MEDIA_ID | PlaybackState.ACTION_PLAY_FROM_SEARCH;
-        if (ready) actions |= PlaybackState.ACTION_SKIP_TO_NEXT | PlaybackState.ACTION_SKIP_TO_PREVIOUS | PlaybackState.ACTION_FAST_FORWARD | PlaybackState.ACTION_REWIND | PlaybackState.ACTION_SEEK_TO;
+        // Screen transport buttons change tracks; physical media keys are handled separately above.
+        if (ready) actions |= PlaybackState.ACTION_SKIP_TO_NEXT | PlaybackState.ACTION_SKIP_TO_PREVIOUS | PlaybackState.ACTION_SEEK_TO;
         int state = error != null ? PlaybackState.STATE_ERROR : loading || (player != null && !ready) ? PlaybackState.STATE_BUFFERING : isPlaying() ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED;
         Bundle extras = new Bundle();
         extras.putBoolean("shuffle", shuffle);
         extras.putBoolean("has_previous_track", !tracks.isEmpty() && order.adjacent(index, -1) >= 0);
         extras.putBoolean("has_next_track", !tracks.isEmpty() && order.adjacent(index, 1) >= 0);
         PlaybackState.Builder status = new PlaybackState.Builder().setActions(actions).setExtras(extras).setState(state, ready ? player.getCurrentPosition() : 0, isPlaying() ? 1 : 0);
+        if (ready) {
+            status.addCustomAction(new PlaybackState.CustomAction.Builder("seek_back_15", "Reculer de 15 secondes", R.drawable.ic_back_15).build());
+            status.addCustomAction(new PlaybackState.CustomAction.Builder("seek_forward_30", "Avancer de 30 secondes", R.drawable.ic_forward_30).build());
+        }
         if (error != null) status.setErrorMessage(error);
-        session.setPlaybackState(status.build());
         String title = tracks.isEmpty() ? (loading ? "Recherche des fichiers…" : "Choisissez un dossier de musique") : tracks.get(index).getDescription().getTitle().toString();
+        long duration = ready ? player.getDuration() : 0;
+        String timer = formatTime(ready ? player.getCurrentPosition() : 0) + " / " + formatTime(duration);
         session.setMetadata(new MediaMetadata.Builder().putString(MediaMetadata.METADATA_KEY_TITLE, title)
-            .putLong(MediaMetadata.METADATA_KEY_DURATION, ready ? player.getDuration() : 0)
+            .putString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE, title)
+            .putString(MediaMetadata.METADATA_KEY_MEDIA_ID, tracks.isEmpty() ? "" : tracks.get(index).getMediaId())
+            .putString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE, timer)
+            .putLong(MediaMetadata.METADATA_KEY_DURATION, duration)
             .putLong(MediaMetadata.METADATA_KEY_TRACK_NUMBER, tracks.isEmpty() ? 0 : index + 1)
             .putLong(MediaMetadata.METADATA_KEY_NUM_TRACKS, tracks.size()).build());
-        if (ready) getSystemService(NotificationManager.class).notify(1, notification());
+        session.setPlaybackState(status.build());
+        if (ready && updateNotification) getSystemService(NotificationManager.class).notify(1, notification());
+    }
+    private static String formatTime(long milliseconds) {
+        long seconds = Math.max(0, milliseconds) / 1000;
+        return seconds >= 3600
+            ? String.format(Locale.FRANCE, "%d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60)
+            : String.format(Locale.FRANCE, "%d:%02d", seconds / 60, seconds % 60);
     }
     private Notification notification() {
         boolean playing = isPlaying();
@@ -244,7 +347,7 @@ public class PlaybackService extends MediaBrowserService {
     @Override public BrowserRoot onGetRoot(String packageName, int uid, Bundle hints) { return new BrowserRoot("root", null); }
     @Override public void onLoadChildren(String parent, Result<List<MediaBrowser.MediaItem>> result) { result.sendResult("root".equals(parent) ? new ArrayList<>(tracks) : Collections.emptyList()); }
     @Override public void onDestroy() {
-        generation++; handler.removeCallbacksAndMessages(null); io.shutdownNow(); save(); releasePlayer();
+        scanGeneration = ++generation; handler.removeCallbacksAndMessages(null); io.shutdownNow(); save(); releasePlayer();
         audio.abandonAudioFocusRequest(focus); unregisterReceiver(noisy); session.release();
         stopForeground(STOP_FOREGROUND_REMOVE); super.onDestroy();
     }
